@@ -3,6 +3,8 @@
 [![Python](https://img.shields.io/badge/python-3.11+-3776AB?logo=python&logoColor=white)]()
 [![License](https://img.shields.io/badge/license-MIT-red)]()
 [![Made By](https://img.shields.io/badge/Made%20By-YoruBoku-blueviolet)]()
+---
+
 A fast Discord bot that uses **Gemini (gemini-2.5-flash-lite)** for conversational AI and **OpenRouter** (Venice/Dolphin models) for uncensored responses.  
 Each user gets an isolated conversation history stored separately, which expires after 1 hour of inactivity.
 
