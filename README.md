@@ -1,4 +1,4 @@
-# Vito-Bot (notweb)
+# Vito-Bot
 
 **Tags:** `python` `discord` `github/yoruboku` `mit-license` `openrouter` `gemini`  
 
