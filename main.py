@@ -8,9 +8,10 @@ import sys
 from datetime import datetime, timedelta
 
 # --- PRODUCTION LOGGING SETUP ---
+# Logs are written to vito.log file and stdout
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
     handlers=[
         logging.FileHandler("vito.log"),
         logging.StreamHandler(sys.stdout)
@@ -32,16 +33,17 @@ def load_config():
 
 settings = load_config()
 
-# --- SAFE CONFIG GETTERS ---
+# --- CONFIG GETTERS ---
 CREATOR_ID = int(settings.get('creator_id', 0) or 0)
-admin_str = settings.get('admin_ids', "")
-ADMIN_IDS = [int(x.strip()) for x in admin_str.split(',') if x.strip().isdigit()]
+# Handle admin_ids being empty or malformed more robustly
+admin_ids_raw = settings.get('admin_ids', "")
+ADMIN_IDS = [int(x.strip()) for x in str(admin_ids_raw).split(',') if x.strip().isdigit()]
 
 DISCORD_TOKEN = settings.get('discord_token', "").strip()
 GEMINI_KEY = settings.get('gemini_key', "").strip()
 VENICE_KEY = settings.get('venice_key', "").strip()
 
-# Sanitizing Model Names (Removes 'models/' if user accidentally added it)
+# Using the stable model as per your fix
 GEMINI_MODEL = settings.get("model_gemini", "gemini-1.5-flash").replace("models/", "")
 VENICE_MODEL = settings.get("model_venice", "meta-llama/llama-3.1-8b-instruct")
 
@@ -62,13 +64,18 @@ def load_lt_memory():
     if not os.path.exists(MEMORY_FILE): return {}
     try:
         with open(MEMORY_FILE, 'r') as f: return json.load(f)
-    except: return {}
+    except Exception as e:
+        logger.error(f"Failed to load memory: {e}")
+        return {}
 
 def save_lt_memory(data):
     # Atomic write to prevent corruption during crash
     temp_file = MEMORY_FILE + ".tmp"
-    with open(temp_file, 'w') as f: json.dump(data, f, indent=4)
-    os.replace(temp_file, MEMORY_FILE)
+    try:
+        with open(temp_file, 'w') as f: json.dump(data, f, indent=4)
+        os.replace(temp_file, MEMORY_FILE)
+    except Exception as e:
+        logger.error(f"Failed to save memory: {e}")
 
 # --- BOT CLASS ---
 class VitoBot(discord.Client):
@@ -91,12 +98,10 @@ class VitoBot(discord.Client):
         logger.info(f"--- VITO IS ONLINE ---")
         logger.info(f"User: {self.user}")
         logger.info(f"Gemini Model: {GEMINI_MODEL}")
-        logger.info(f"Venice Model: {VENICE_MODEL}")
         context_store.clear()
 
-    # --- ROBUST API CALLS ---
-    async def call_gemini(self, history, system_instruction):
-        # Correct Endpoint Construction
+    # --- API CALLS (FAIL FAST) ---
+    async def call_gemini(self, history, system_instruction, use_search=False):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_KEY}"
         
         payload = {
@@ -108,20 +113,64 @@ class VitoBot(discord.Client):
             }
         }
         
+        # --- GOOGLE SEARCH GROUNDING IMPLEMENTATION ---
+        if use_search:
+            payload['tools'] = [{"google_search": {}}]
+            # Log the specific query being searched for better debugging
+            last_msg = history[-1]['parts'][0]['text'] if history else "Unknown"
+            logger.info(f"Payload set with google_search tool. Query: '{last_msg}'")
+
         try:
             async with self.session.post(url, json=payload) as response:
+                
                 if response.status != 200:
                     error_text = await response.text()
-                    logger.error(f"Gemini API Error {response.status}: {error_text}")
+                    # Log the specific API error, including the 429 status
+                    logger.error(f"Gemini API FAILED ({response.status}). URL: {url}. Details: {error_text}")
+                    
+                    if response.status == 429:
+                        return "Gemini Error 429: Rate limit exceeded. Try again later."
                     if response.status == 404:
-                        return f"Error 404: The model '{GEMINI_MODEL}' does not exist. Check settings.json."
-                    return f"Gemini Error {response.status}. Check console logs."
+                        return f"Gemini Error 404: Model '{GEMINI_MODEL}' not found. Check settings.json."
+                    return f"Gemini Error {response.status}. Check vito.log for details."
                 
+                # Success path
                 data = await response.json()
-                return data['candidates'][0]['content']['parts'][0]['text']
+                
+                # Check for grounded content and inform user/log source
+                output_text = ""
+                try:
+                    output_text = data['candidates'][0]['content']['parts'][0]['text']
+                    
+                    # Enhanced logging to show if grounding was actually used
+                    if use_search:
+                        # Check if groundingMetadata exists
+                        candidate = data.get('candidates', [{}])[0]
+                        grounding_metadata = candidate.get('groundingMetadata')
+                        
+                        if grounding_metadata:
+                            sources = grounding_metadata.get('groundingAttributions', [])
+                            source_uris = [s['web']['uri'] for s in sources if 'web' in s and 'uri' in s['web']]
+                            if source_uris:
+                                logger.info(f"Search Grounding SUCCESS. Sources used: {len(source_uris)}")
+                                output_text += "\n\n*(This answer was generated using current web data.)*"
+                            else:
+                                logger.info("Search tool requested, result returned but no specific web sources cited.")
+                                # If no sources cited for a search query, it might be vague.
+                                if "I cannot" in output_text or "Please specify" in output_text:
+                                    output_text += "\n\n*(Tip: Try a more specific search query for better results.)*"
+                        else:
+                            logger.warning("Search tool requested, but no grounding metadata found in response.")
+                        
+                    return output_text
+                    
+                except (KeyError, IndexError):
+                    return "Error: Gemini returned an empty response."
+
         except Exception as e:
             logger.error(f"Gemini Connection Failed: {e}")
             return "Error: Could not connect to Gemini."
+
 
     async def call_openrouter(self, messages, system_instruction):
         url = "https://openrouter.ai/api/v1/chat/completions"
@@ -129,8 +178,8 @@ class VitoBot(discord.Client):
         formatted_msgs = [{"role": "system", "content": system_instruction}]
         for msg in messages:
             role = "user" if msg['role'] == "user" else "assistant"
-            # Safety check for empty parts
-            if msg.get('parts') and msg['parts'][0].get('text'):
+            # Ensure msg parts exists and has text before accessing
+            if msg.get('parts') and len(msg['parts']) > 0 and msg['parts'][0].get('text'):
                 formatted_msgs.append({"role": role, "content": msg['parts'][0]['text']})
 
         headers = {
@@ -139,67 +188,73 @@ class VitoBot(discord.Client):
             "HTTP-Referer": "https://discord.com",
             "X-Title": "Vito Bot"
         }
-        payload = {
-            "model": VENICE_MODEL,
-            "messages": formatted_msgs,
-            "temperature": 0.7
-        }
+        payload = {"model": VENICE_MODEL, "messages": formatted_msgs, "temperature": 0.7}
         
         try:
             async with self.session.post(url, headers=headers, json=payload) as response:
+                    
                 if response.status != 200:
                     text = await response.text()
-                    logger.error(f"Venice API Error {response.status}: {text}")
-                    return f"Venice Error {response.status}."
+                    logger.error(f"Venice API FAILED ({response.status}). Details: {text}")
+                    
+                    if response.status == 429:
+                        return "Venice Error 429: Rate limit exceeded. Try again later."
+                    return f"Venice Error {response.status}. Check vito.log for details."
+                
                 data = await response.json()
                 return data['choices'][0]['message']['content']
+            
         except Exception as e:
-            logger.error(f"Venice Connection Failed: {e}")
+            logger.error(f"Venice Request Failed: {e}")
             return "Error: Could not connect to Venice."
+        
 
 client = VitoBot()
 
 # --- MESSAGE HANDLING ---
+def get_priority(user_id):
+    if user_id == CREATOR_ID: return 3
+    if user_id in ADMIN_IDS: return 2
+    return 1
+
 @client.event
 async def on_message(message):
     if message.author == client.user: return
     
-    # 1. CHECK MENTIONS
     is_mentioned = client.user in message.mentions
     is_reply = (message.reference and message.reference.cached_message and 
                 message.reference.cached_message.author == client.user)
     
-    if not (is_mentioned or is_reply):
-        return
+    if not (is_mentioned or is_reply): return
 
-    # 2. PARSE INPUT
+    # 1. PARSE INPUT
     raw_content = message.content.replace(f'<@{client.user.id}>', '').strip()
     user_id = message.author.id
     
-    # Split command
     parts = raw_content.split(' ', 1)
     cmd = parts[0].lower() if parts else ""
     args = parts[1] if len(parts) > 1 else ""
 
-    # 3. STOP COMMAND (Priority)
+    # 2. STOP COMMAND
     if cmd == "stop":
-        # Check own tasks
         if user_id in client.active_tasks and not client.active_tasks[user_id].done():
             client.active_tasks[user_id].cancel()
             await message.reply("Request cancelled.", mention_author=True)
             return
-        # Check admin tasks
-        user_prio = 3 if user_id == CREATOR_ID else (2 if user_id in ADMIN_IDS else 1)
+        
+        user_prio = get_priority(user_id)
         if user_prio > 1 and message.reference:
-            target_msg = await message.channel.fetch_message(message.reference.message_id)
-            target_id = target_msg.author.id
-            if target_id in client.active_tasks:
-                client.active_tasks[target_id].cancel()
-                await message.reply(f"Admin Force Stop applied to <@{target_id}>.", mention_author=True)
+            try:
+                target_msg = await message.channel.fetch_message(message.reference.message_id)
+                target_id = target_msg.author.id
+                if target_id in client.active_tasks and get_priority(target_id) < user_prio:
+                    client.active_tasks[target_id].cancel()
+                    await message.reply(f"Admin Force Stop applied to <@{target_id}>.", mention_author=True)
+            except Exception as e:
+                logger.error(f"Error during admin stop: {e}")
         return
 
-    # 4. MEMORY & CONTEXT
-    # Auto-refresh context after 1 hour
+    # 3. CONTEXT & MEMORY SETUP
     now = datetime.now()
     if user_id not in context_store or (now - context_store[user_id]['last_active'] > timedelta(hours=1)):
         context_store[user_id] = {'last_active': now, 'history': []}
@@ -208,9 +263,10 @@ async def on_message(message):
     memories = load_lt_memory()
     user_mem = memories.get(str(user_id), [])
 
-    # 5. COMMAND ROUTING
+    # 4. COMMAND ROUTING
     mode = "gemini"
     final_prompt = raw_content
+    use_search = False # Default: No search grounding
 
     if cmd == "newchat":
         context_store[user_id]['history'] = []
@@ -218,9 +274,7 @@ async def on_message(message):
         return
 
     elif cmd == "remember":
-        if not args:
-            await message.reply("Usage: @Vito remember [text]", mention_author=True)
-            return
+        if not args: return await message.reply("Usage: @Vito remember [text]", mention_author=True)
         timestamp = datetime.now().strftime("%Y-%m-%d")
         user_mem.append(f"[{timestamp}] {args}")
         memories[str(user_id)] = user_mem
@@ -231,13 +285,19 @@ async def on_message(message):
     elif cmd in ["notnice", "venice"]:
         mode = "venice"
         final_prompt = args if args else " "
-
-    # 6. SYSTEM PROMPT CONSTRUCTION
+        
+    elif cmd == "search": # NEW SEARCH COMMAND
+        mode = "gemini"
+        # Corrected Python ternary expression syntax
+        final_prompt = args if args else "What is the news today?" 
+        use_search = True # Enable search tool
+        
+    # 5. SYSTEM PROMPT CONSTRUCTION (for memory injection)
     current_sys = BASE_SYSTEM_PROMPT
     if user_mem:
         current_sys += "\n\n[USER MEMORIES]:\n" + "\n".join([f"- {m}" for m in user_mem])
 
-    # 7. ASYNC EXECUTION
+    # 6. ASYNC EXECUTION
     async def process_request():
         try:
             async with message.channel.typing():
@@ -246,7 +306,8 @@ async def on_message(message):
                 
                 # API Call
                 if mode == "gemini":
-                    response_text = await client.call_gemini(history, current_sys)
+                    # Pass search flag to call_gemini
+                    response_text = await client.call_gemini(history, current_sys, use_search=use_search)
                 else:
                     response_text = await client.call_openrouter(history, current_sys)
                 
@@ -276,5 +337,7 @@ async def on_message(message):
     task = asyncio.create_task(process_request())
     client.active_tasks[user_id] = task
 
-# --- START ---
-client.run(DISCORD_TOKEN)
+try:
+    client.run(DISCORD_TOKEN)
+except discord.HTTPException as e:
+    logger.critical(f"Discord Login Failed. Check your DISCORD_TOKEN. Error: {e}")
