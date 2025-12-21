@@ -41,11 +41,11 @@ ADMIN_IDS = [int(x.strip()) for x in str(admin_ids_raw).split(',') if x.strip().
 
 DISCORD_TOKEN = settings.get('discord_token', "").strip()
 GEMINI_KEY = settings.get('gemini_key', "").strip()
-VENICE_KEY = settings.get('venice_key', "").strip()
+OPENROUTER_KEY = settings.get('openrouter_key', "").strip()
 
 # Using the stable model as per your fix
-GEMINI_MODEL = settings.get("model_gemini", "gemini-1.5-flash").replace("models/", "")
-VENICE_MODEL = settings.get("model_venice", "meta-llama/llama-3.1-8b-instruct")
+GEMINI_MODEL = settings.get("model_gemini", "gemini-2.5-flash").replace("models/", "")
+OPENROUTER_MODEL = settings.get("model_openrouter", "google/gemma-3-4b-it:free")
 
 if not DISCORD_TOKEN or not GEMINI_KEY:
     logger.critical("Missing API Keys in settings.json.")
@@ -153,7 +153,6 @@ class VitoBot(discord.Client):
                             source_uris = [s['web']['uri'] for s in sources if 'web' in s and 'uri' in s['web']]
                             if source_uris:
                                 logger.info(f"Search Grounding SUCCESS. Sources used: {len(source_uris)}")
-                                output_text += "\n\n*(This answer was generated using current web data.)*"
                             else:
                                 logger.info("Search tool requested, result returned but no specific web sources cited.")
                                 # If no sources cited for a search query, it might be vague.
@@ -183,30 +182,30 @@ class VitoBot(discord.Client):
                 formatted_msgs.append({"role": role, "content": msg['parts'][0]['text']})
 
         headers = {
-            "Authorization": f"Bearer {VENICE_KEY}",
+            "Authorization": f"Bearer {OPENROUTER_KEY}",
             "Content-Type": "application/json",
             "HTTP-Referer": "https://discord.com",
             "X-Title": "Vito Bot"
         }
-        payload = {"model": VENICE_MODEL, "messages": formatted_msgs, "temperature": 0.7}
+        payload = {"model": OPENROUTER_MODEL, "messages": formatted_msgs, "temperature": 0.7}
         
         try:
             async with self.session.post(url, headers=headers, json=payload) as response:
                     
                 if response.status != 200:
                     text = await response.text()
-                    logger.error(f"Venice API FAILED ({response.status}). Details: {text}")
+                    logger.error(f"OpenRouter API FAILED ({response.status}). Details: {text}")
                     
                     if response.status == 429:
-                        return "Venice Error 429: Rate limit exceeded. Try again later."
-                    return f"Venice Error {response.status}. Check vito.log for details."
+                        return "OpenRouter Error 429: Rate limit exceeded. Try again later."
+                    return f"OpenRouter Error {response.status}. Check vito.log for details."
                 
                 data = await response.json()
                 return data['choices'][0]['message']['content']
             
         except Exception as e:
-            logger.error(f"Venice Request Failed: {e}")
-            return "Error: Could not connect to Venice."
+            logger.error(f"OpenRouter Request Failed: {e}")
+            return "Error: Could not connect to OpenRouter."
         
 
 client = VitoBot()
@@ -222,15 +221,32 @@ async def on_message(message):
     if message.author == client.user: return
     
     is_mentioned = client.user in message.mentions
-    is_reply = (message.reference and message.reference.cached_message and 
-                message.reference.cached_message.author == client.user)
+    is_reply = (message.reference and client.user in message.mentions)
+
+    # Check if the message is a direct message to the bot
+    is_dm = isinstance(message.channel, discord.DMChannel)
     
-    if not (is_mentioned or is_reply): return
+    if not (is_mentioned or is_reply or is_dm): return
 
     # 1. PARSE INPUT
     raw_content = message.content.replace(f'<@{client.user.id}>', '').strip()
     user_id = message.author.id
-    
+
+    # Handle replied-to messages to include their content in the prompt
+    if is_reply and message.reference:
+        try:
+            # Fetch the replied-to message
+            replied_message = await message.channel.fetch_message(message.reference.message_id)
+            replied_content = replied_message.content.replace(f'<@{client.user.id}>', '').strip()
+            
+            # Prepend the old message's content to the new one
+            raw_content = f"{replied_content}\n{raw_content}"
+            
+        except discord.NotFound:
+            logger.warning(f"Could not find replied to message with ID: {message.reference.message_id}")
+        except Exception as e:
+            logger.error(f"Error fetching replied message: {e}")
+
     parts = raw_content.split(' ', 1)
     cmd = parts[0].lower() if parts else ""
     args = parts[1] if len(parts) > 1 else ""
@@ -266,11 +282,36 @@ async def on_message(message):
     # 4. COMMAND ROUTING
     mode = "gemini"
     final_prompt = raw_content
-    use_search = False # Default: No search grounding
+    use_search = True # Default: All Gemini requests use search grounding
 
     if cmd == "newchat":
         context_store[user_id]['history'] = []
         await message.reply("Context cleared.", mention_author=True)
+        return
+
+    elif cmd == "clear":
+        if not isinstance(message.channel, discord.DMChannel) and not message.channel.permissions_for(message.guild.me).manage_messages:
+            return await message.reply("I need the 'Manage Messages' permission to do that.", mention_author=True)
+        
+        try:
+            # If no number is provided, limit will be None, purging all messages.
+            limit = int(args) if args and args.isdigit() else None
+        except ValueError:
+            limit = None
+
+        await message.delete()  # Delete the command message
+
+        try:
+            # When limit is None, all messages are purged. 
+            # The check function is removed to delete all messages, not just bot-related ones.
+            deleted = await message.channel.purge(limit=limit)
+            feedback_msg = await message.channel.send(f"🧹 Cleared {len(deleted)} message(s).")
+            await asyncio.sleep(5)
+            await feedback_msg.delete()
+        except discord.Forbidden:
+            logger.warning(f"Missing 'Manage Messages' permission in channel {message.channel.id}")
+        except Exception as e:
+            logger.error(f"Error during purge command: {e}")
         return
 
     elif cmd == "remember":
@@ -282,15 +323,10 @@ async def on_message(message):
         await message.reply("Memory saved to database.", mention_author=True)
         return
 
-    elif cmd in ["notnice", "venice"]:
-        mode = "venice"
+    elif cmd in ["notnice", "openrouter"]:
+        mode = "openrouter"
         final_prompt = args if args else " "
-        
-    elif cmd == "search": # NEW SEARCH COMMAND
-        mode = "gemini"
-        # Corrected Python ternary expression syntax
-        final_prompt = args if args else "What is the news today?" 
-        use_search = True # Enable search tool
+        use_search = False # OpenRouter mode does not use Gemini search
         
     # 5. SYSTEM PROMPT CONSTRUCTION (for memory injection)
     current_sys = BASE_SYSTEM_PROMPT

@@ -29,7 +29,7 @@ Vito intelligently routes messages between two engines:
 
 - **Primary (Gemini 1.5 Flash):** Fast, logical, general assistance  
 - **Secondary (OpenRouter/Llama):** Accessed via `@Vito notnice` for alternative or unfiltered reasoning  
-  - Default: `meta-llama/llama-3.1-8b-instruct`
+  - Default: `google/gemma-3-4b-it:free`
 
 ### 👑 Hierarchical Access Control  
 A three-tier system ensures stable resource usage:
@@ -153,13 +153,13 @@ All settings are stored in `settings.json`.
   "admin_ids": "ADMIN_ID_1, ADMIN_ID_2",
   "discord_token": "YOUR_DISCORD_TOKEN",
   "gemini_key": "YOUR_GEMINI_KEY",
-  "venice_key": "YOUR_OPENROUTER_KEY",
-  "model_gemini": "gemini-1.5-flash",
-  "model_venice": "meta-llama/llama-3.1-8b-instruct"
+  "openrouter_key": "YOUR_OPENROUTER_KEY",
+  "model_gemini": "gemini-2.5-flash",
+  "model_openrouter": "google/gemma-3-4b-it:free"
 }
 ```
 
-To change the Llama/OpenRouter model, update `model_venice`.
+To change the Llama/OpenRouter model, update `model_openrouter`.
 
 Popular options:
 
@@ -172,10 +172,11 @@ Popular options:
 
 | Command | Example | Description |
 |--------|---------|-------------|
-| **Chat** | `@Vito how do I cook rice?` | Standard Gemini response |
+| **Chat** | `@Vito how do I cook rice?` | Standard Gemini response (now with automatic search grounding) |
 | **Remember** | `@Vito remember I have a cat named Luna` | Saves to permanent memory |
 | **Recall** | `@Vito what is my cat’s name?` | Automatically answered from memory |
 | **New Chat** | `@Vito newchat` | Clears short-term RAM context |
+| **Clear** | `@Vito clear` or `@Vito clear 50` | Deletes bot commands and replies from recent history (default search: 1000 messages). |
 | **Not Nice** | `@Vito notnice define anarchy` | Uses OpenRouter model |
 | **Stop** | `@Vito stop` | Terminates current generation |
 
