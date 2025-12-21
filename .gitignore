@@ -1,0 +1,16 @@
+# Local settings - DO NOT COMMIT
+settings.json
+memory.json
+
+# Log files
+vito.log
+*.log
+
+# Python virtual environment
+venv/
+__pycache__/
+*.pyc
+
+# IDE/Editor specific
+.idea/
+.vscode/
