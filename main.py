@@ -52,8 +52,7 @@ if not DISCORD_TOKEN or not GEMINI_KEY:
     sys.exit(1)
 
 # --- SYSTEM PROMPT ---
-BASE_SYSTEM_PROMPT = """Your name is Vito. You were created by Yoruboku for the group Ravence. 
-Respond with clarity, precision, and concise reasoning.
+BASE_SYSTEM_PROMPT = """Your name is Vito. You were created by Yoruboku.
 """
 
 # --- MEMORY SYSTEM ---
